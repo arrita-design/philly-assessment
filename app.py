@@ -61,9 +61,9 @@ def normalize_address_for_search(address: str) -> str:
             a = a[: -len(long_suffix)] + short_suffix
             break
 
-    # Escape single quotes for SQL and turn into an ILIKE pattern
+    # Escape single quotes for SQL and turn into an ILIKE *contains* pattern
     a = a.replace("'", "''")
-    return a + "%"   # e.g. "780 UNION ST%"
+    return f"%{a}%"   # e.g. "%780 UNION ST%"
 
 
 def lookup_single_address(address: str, years: List[int]) -> List[Dict]:

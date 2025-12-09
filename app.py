@@ -1,269 +1,272 @@
+import io
+import requests
+import pandas as pd
 import streamlit as st
 
-# Show something on screen ASAP (so we never get a blank page)
-st.set_page_config(page_title="Philadelphia Assessment Lookup", layout="wide")
-st.title("Philadelphia Assessment Lookup")
-st.write("Paste addresses or upload a CSV, then click **Run lookup**.")
-
-import textwrap
-
-# Try to load pandas and requests and show a clear error if they fail
-try:
-    import pandas as pd
-    import requests
-except Exception as e:
-    st.error(
-        "Problem loading required Python packages "
-        "(pandas / requests). Please make sure `requirements.txt` "
-        "contains:\n\n"
-        "streamlit\npandas\nrequests\n\n"
-        f"Technical error: {e}"
-    )
-    st.stop()
-
-
-# ---------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------
-
+# CARTO SQL endpoint for Philly open data
 CARTO_SQL_URL = "https://phl.carto.com/api/v2/sql"
-PROPERTIES_TABLE = "opa_properties_public_pde"   # base property table
-ASSESSMENTS_TABLE = "assessments"               # assessment history table
 
+# ---------- Helper functions ----------
 
-# ---------------------------------------------------------
-# HELPER FUNCTIONS
-# ---------------------------------------------------------
-
-def clean_address(raw: str) -> str:
-    """Normalize an address string a bit."""
-    if not isinstance(raw, str):
-        return ""
-    return " ".join(raw.strip().upper().split())
-
-
-def carto_sql(sql: str) -> pd.DataFrame:
-    """Run a SQL query against the Carto API and return a DataFrame."""
-    params = {"q": sql, "format": "json"}
-    resp = requests.get(CARTO_SQL_URL, params=params, timeout=30)
-
+def call_carto(sql: str) -> dict:
+    """Run a SQL query against the CARTO API."""
+    resp = requests.get(CARTO_SQL_URL, params={"q": sql})
     if resp.status_code != 200:
-        st.error(f"Carto API error {resp.status_code}: {resp.text[:300]}")
-        return pd.DataFrame()
-
-    data = resp.json()
-    rows = data.get("rows", [])
-    return pd.DataFrame(rows)
+        # Bubble the error up so we can show it in the UI
+        raise RuntimeError(f"Carto API error {resp.status_code}: {resp.text}")
+    return resp.json()
 
 
-def lookup_one_address(address: str, years: list[int]) -> pd.DataFrame:
+def normalize_address_for_search(address: str) -> str | None:
     """
-    Look up a single address in the OPA data for the selected tax years.
-
-    Assumptions about the City tables:
-    - `opa_properties_public_pde` has `full_address`, `parcel_number`, `zip_code`
-    - `assessments` has `year`, `market_value`, `exempt_land`,
-      `exempt_improvement`, `market_value_date`
+    Clean user address and turn it into a pattern we can use with ILIKE
+    against p.location in opa_properties_public_pde.
     """
+    if not address:
+        return None
 
-    addr = clean_address(address)
-    if not addr:
-        return pd.DataFrame()
+    # Only use first part if they paste "780 Union Street, Philadelphia, PA"
+    a = address.strip().split(",")[0]
 
-    addr_sql = addr.replace("'", "''")
-    years_list = ", ".join(str(y) for y in years)
+    if not a:
+        return None
 
+    # Uppercase for consistency
+    a = a.upper()
+
+    # Strip leading zeros from the house number
+    parts = a.split()
+    if parts and parts[0].isdigit():
+        try:
+            parts[0] = str(int(parts[0]))  # "0780" -> "780"
+        except ValueError:
+            pass
+    a = " ".join(parts)
+
+    # Normalize common street suffixes to match OPA's abbreviations
+    suffix_map = {
+        " STREET": " ST",
+        " AVENUE": " AVE",
+        " BOULEVARD": " BLVD",
+        " ROAD": " RD",
+        " DRIVE": " DR",
+        " PLACE": " PL",
+        " COURT": " CT",
+        " LANE": " LN",
+        " TERRACE": " TER",
+    }
+    for long_suffix, short_suffix in suffix_map.items():
+        if a.endswith(long_suffix):
+            a = a[: -len(long_suffix)] + short_suffix
+            break
+
+    # Escape single quotes for SQL and turn into an ILIKE pattern
+    a = a.replace("'", "''")
+    return a + "%"   # e.g. "780 UNION ST%"
+
+
+def lookup_single_address(address: str, years: list[int]) -> list[dict]:
+    """
+    Look up one address for the selected tax years.
+    Returns a list of rows (dicts) from the joined OPA + assessments tables.
+    """
+    pattern = normalize_address_for_search(address)
+    if not pattern:
+        return []
+
+    years_clause = ", ".join(str(y) for y in sorted(set(years)))
+
+    # NOTE: key fixes here:
+    #  - p.location AS full_address   (NOT p.full_address)
+    #  - a.year AS tax_year           (NOT a.tax_year)
     sql = f"""
         SELECT
             p.parcel_number,
-            p.full_address,
+            p.location AS full_address,
             p.zip_code,
             a.year AS tax_year,
             a.market_value,
             a.exempt_land,
-            a.exempt_improvement,
+            a.exempt_building,
+            a.taxable_land,
+            a.taxable_building,
             a.market_value_date
-        FROM {PROPERTIES_TABLE} AS p
-        JOIN {ASSESSMENTS_TABLE} AS a
+        FROM opa_properties_public_pde p
+        JOIN assessments a
           ON p.parcel_number = a.parcel_number
-        WHERE UPPER(p.full_address) = '{addr_sql}'
-          AND a.year IN ({years_list})
+        WHERE a.year IN ({years_clause})
+          AND p.location ILIKE '{pattern}'
         ORDER BY a.year
     """
 
-    return carto_sql(sql)
+    data = call_carto(sql)
+    return data.get("rows", [])
 
 
-def lookup_many_addresses(addresses: list[str], years: list[int]) -> pd.DataFrame:
-    """Loop over many addresses and stack the results."""
-    frames = []
-    total = len(addresses)
-
-    for i, addr in enumerate(addresses, start=1):
-        if not addr.strip():
-            continue
-
-        with st.spinner(f"Looking up {addr} ({i}/{total})…"):
-            df = lookup_one_address(addr, years)
-
-            if df.empty:
-                frames.append(
-                    pd.DataFrame(
-                        {
-                            "input_address": [addr],
-                            "parcel_number": [None],
-                            "full_address": [None],
-                            "zip_code": [None],
-                            "tax_year": [None],
-                            "market_value": [None],
-                            "note": ["No match found"],
-                        }
-                    )
-                )
-            else:
-                df["input_address"] = addr
-                frames.append(df)
-
-    if not frames:
-        return pd.DataFrame()
-
-    out = pd.concat(frames, ignore_index=True)
-
-    cols_order = [
-        "input_address",
-        "parcel_number",
-        "full_address",
-        "zip_code",
-        "tax_year",
-        "market_value",
-        "exempt_land",
-        "exempt_improvement",
-        "market_value_date",
-        "note",
-    ]
-
-    for c in cols_order:
-        if c not in out.columns:
-            out[c] = None
-
-    return out[cols_order]
-
-
-# ---------------------------------------------------------
-# UI LAYOUT
-# ---------------------------------------------------------
-
-st.markdown(
+def build_results(addresses: list[str], years: list[int]) -> tuple[pd.DataFrame, list[str]]:
     """
-Bulk lookup tool for **Philadelphia OPA** assessments.
+    Run the lookup for a list of addresses and return:
+    - a DataFrame of results
+    - a list of error messages (if any)
+    """
+    rows = []
+    errors = []
 
-**How to use:**
+    unique_addresses = [a for a in dict.fromkeys(a.strip() for a in addresses) if a.strip()]
 
-1. Paste addresses (one per line) OR upload a CSV with a column named `address`.
-2. Choose the tax years you want (2025, 2026).
-3. Click **Run lookup** to pull values from the City's open-data API.
-"""
+    progress_text = "Looking up {} unique addresses…".format(len(unique_addresses))
+    progress = st.progress(0, text=progress_text)
+
+    for idx, addr in enumerate(unique_addresses, start=1):
+        try:
+            matches = lookup_single_address(addr, years)
+        except Exception as e:
+            errors.append(f"{addr}: {e}")
+            matches = []
+
+        if matches:
+            for m in matches:
+                m = dict(m)
+                m["input_address"] = addr
+                rows.append(m)
+        else:
+            # No match found – add a placeholder row
+            rows.append({
+                "input_address": addr,
+                "parcel_number": None,
+                "full_address": None,
+                "zip_code": None,
+                "tax_year": ", ".join(str(y) for y in years),
+                "market_value": None,
+                "exempt_land": None,
+                "exempt_building": None,
+                "taxable_land": None,
+                "taxable_building": None,
+                "market_value_date": None,
+                "note": "No match found",
+            })
+
+        progress.progress(idx / len(unique_addresses), text=progress_text)
+
+    progress.empty()
+
+    if rows:
+        df = pd.DataFrame(rows)
+        # Order columns a bit nicer if they exist
+        col_order = [
+            "input_address",
+            "parcel_number",
+            "full_address",
+            "zip_code",
+            "tax_year",
+            "market_value",
+            "exempt_land",
+            "exempt_building",
+            "taxable_land",
+            "taxable_building",
+            "market_value_date",
+            "note",
+        ]
+        df = df[[c for c in col_order if c in df.columns]]
+    else:
+        df = pd.DataFrame()
+
+    return df, errors
+
+
+# ---------- Streamlit UI ----------
+
+st.set_page_config(
+    page_title="Philadelphia Assessment Lookup",
+    layout="wide",
 )
 
-st.divider()
+st.title("Philadelphia Assessment Lookup")
 
-col_left, col_right = st.columns([2, 1])
+st.write(
+    "Paste a list of **Philadelphia property addresses** or upload a CSV with an "
+    " `address` column to look up **market values for 2025 and 2026** in bulk."
+)
 
-with col_left:
-    st.subheader("1. Enter addresses")
+# Address input
+addr_text = st.text_area(
+    "Paste addresses here",
+    height=200,
+    placeholder="780 Union Street\n0373 Sloan Street\n0711 N. 40th Street\n…",
+)
 
-    sample_hint = textwrap.dedent(
-        """\
-        One address per line, for example:
+st.write("**OR** upload a CSV with a column named `address`:")
+uploaded_file = st.file_uploader(
+    "Drag and drop file here",
+    type=["csv"],
+    label_visibility="collapsed",
+)
 
-        0373 Sloan Street
-        0711 N. 40th Street
-        3905 Aspen Street
-        """
-    )
-
-    text_addresses = st.text_area(
-        "Paste addresses here",
-        height=220,
-        help="Paste straight from Excel or Google Sheets.",
-        placeholder=sample_hint,
-    )
-
-    st.caption("OR upload a CSV with a column named `address`:")
-    file = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
-
-with col_right:
-    st.subheader("2. Choose tax years")
-
+# Year selection
+col_y1, col_y2 = st.columns(2)
+with col_y1:
     year_2025 = st.checkbox("2025", value=True)
+with col_y2:
     year_2026 = st.checkbox("2026", value=True)
 
-    run_button = st.button("🔍 Run lookup", type="primary")
+years = []
+if year_2025:
+    years.append(2025)
+if year_2026:
+    years.append(2026)
 
+if not years:
+    st.warning("Please select at least one tax year.")
+    st.stop()
 
-# ---------------------------------------------------------
-# RUN LOOKUP
-# ---------------------------------------------------------
+# Build address list
+addresses = []
 
-if run_button:
-    years = []
-    if year_2025:
-        years.append(2025)
-    if year_2026:
-        years.append(2026)
+# From text area
+if addr_text.strip():
+    addresses.extend([line.strip() for line in addr_text.splitlines() if line.strip()])
 
-    if not years:
-        st.warning("Select at least one tax year.")
+# From CSV
+if uploaded_file is not None:
+    try:
+        df_upload = pd.read_csv(uploaded_file)
+        if "address" in df_upload.columns:
+            addresses.extend(
+                [str(a).strip() for a in df_upload["address"].tolist() if str(a).strip()]
+            )
+        else:
+            st.error("Uploaded CSV must have a column named `address`.")
+    except Exception as e:
+        st.error(f"Could not read CSV file: {e}")
+
+if st.button("🔍 Run lookup", type="primary"):
+    if not addresses:
+        st.warning("Please paste at least one address or upload a CSV.")
         st.stop()
 
-    addresses = []
+    st.info(f"Looking up {len(addresses)} addresses…")
 
-    if text_addresses.strip():
-        addresses.extend([line for line in text_addresses.splitlines() if line.strip()])
+    results_df, error_list = build_results(addresses, years)
 
-    if file is not None:
-        try:
-            df_in = pd.read_csv(file)
-            if "address" not in df_in.columns:
-                st.error("Your CSV must have a column named **address**.")
-                st.stop()
-            csv_addresses = df_in["address"].dropna().astype(str).tolist()
-            addresses.extend(csv_addresses)
-        except Exception as e:
-            st.error(f"Could not read CSV: {e}")
-            st.stop()
-
-    seen = set()
-    unique = []
-    for a in addresses:
-        ca = clean_address(a)
-        if ca and ca not in seen:
-            unique.append(a)
-            seen.add(ca)
-
-    if not unique:
-        st.warning("Please enter at least one address.")
-        st.stop()
-
-    st.info(f"Looking up **{len(unique)}** unique addresses…")
-
-    results = lookup_many_addresses(unique, years)
-
-    if results.empty:
-        st.warning("No results found. Check that the address format matches the City's data.")
-        st.stop()
+    if error_list:
+        with st.expander("Show API errors (for debugging)"):
+            for msg in error_list:
+                st.error(msg)
 
     st.success("Lookup complete!")
 
     st.subheader("Results")
-    st.dataframe(results, use_container_width=True)
 
-    csv_bytes = results.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download results as CSV",
-        data=csv_bytes,
-        file_name="philly_assessments_lookup.csv",
-        mime="text/csv",
-    )
-else:
-    st.info("Paste addresses or upload a CSV, then click **Run lookup**.")
+    if results_df.empty:
+        st.write("No results returned.")
+    else:
+        st.dataframe(results_df, use_container_width=True)
+
+        # Download as CSV
+        csv_bytes = results_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="📥 Download results as CSV",
+            data=csv_bytes,
+            file_name="philly_assessments_results.csv",
+            mime="text/csv",
+        )

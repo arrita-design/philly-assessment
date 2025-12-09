@@ -1,35 +1,36 @@
-import io
 import requests
 import pandas as pd
 import streamlit as st
+from typing import List, Tuple, Dict
 
 # CARTO SQL endpoint for Philly open data
 CARTO_SQL_URL = "https://phl.carto.com/api/v2/sql"
 
+
 # ---------- Helper functions ----------
 
-def call_carto(sql: str) -> dict:
+def call_carto(sql: str) -> Dict:
     """Run a SQL query against the CARTO API."""
     resp = requests.get(CARTO_SQL_URL, params={"q": sql})
     if resp.status_code != 200:
-        # Bubble the error up so we can show it in the UI
+        # Let the UI show this if needed
         raise RuntimeError(f"Carto API error {resp.status_code}: {resp.text}")
     return resp.json()
 
 
-def normalize_address_for_search(address: str) -> str | None:
+def normalize_address_for_search(address: str) -> str:
     """
     Clean user address and turn it into a pattern we can use with ILIKE
     against p.location in opa_properties_public_pde.
     """
     if not address:
-        return None
+        return ""
 
     # Only use first part if they paste "780 Union Street, Philadelphia, PA"
     a = address.strip().split(",")[0]
 
     if not a:
-        return None
+        return ""
 
     # Uppercase for consistency
     a = a.upper()
@@ -65,7 +66,7 @@ def normalize_address_for_search(address: str) -> str | None:
     return a + "%"   # e.g. "780 UNION ST%"
 
 
-def lookup_single_address(address: str, years: list[int]) -> list[dict]:
+def lookup_single_address(address: str, years: List[int]) -> List[Dict]:
     """
     Look up one address for the selected tax years.
     Returns a list of rows (dicts) from the joined OPA + assessments tables.
@@ -76,9 +77,7 @@ def lookup_single_address(address: str, years: list[int]) -> list[dict]:
 
     years_clause = ", ".join(str(y) for y in sorted(set(years)))
 
-    # NOTE: key fixes here:
-    #  - p.location AS full_address   (NOT p.full_address)
-    #  - a.year AS tax_year           (NOT a.tax_year)
+    # Use p.location (not full_address) and a.year (not tax_year)
     sql = f"""
         SELECT
             p.parcel_number,
@@ -103,18 +102,22 @@ def lookup_single_address(address: str, years: list[int]) -> list[dict]:
     return data.get("rows", [])
 
 
-def build_results(addresses: list[str], years: list[int]) -> tuple[pd.DataFrame, list[str]]:
+def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame, List[str]]:
     """
     Run the lookup for a list of addresses and return:
     - a DataFrame of results
     - a list of error messages (if any)
     """
-    rows = []
-    errors = []
+    rows: List[Dict] = []
+    errors: List[str] = []
 
+    # Deduplicate while preserving order
     unique_addresses = [a for a in dict.fromkeys(a.strip() for a in addresses) if a.strip()]
 
-    progress_text = "Looking up {} unique addresses…".format(len(unique_addresses))
+    if not unique_addresses:
+        return pd.DataFrame(), ["No addresses provided"]
+
+    progress_text = f"Looking up {len(unique_addresses)} addresses…"
     progress = st.progress(0, text=progress_text)
 
     for idx, addr in enumerate(unique_addresses, start=1):
@@ -126,9 +129,9 @@ def build_results(addresses: list[str], years: list[int]) -> tuple[pd.DataFrame,
 
         if matches:
             for m in matches:
-                m = dict(m)
-                m["input_address"] = addr
-                rows.append(m)
+                rec = dict(m)
+                rec["input_address"] = addr
+                rows.append(rec)
         else:
             # No match found – add a placeholder row
             rows.append({
@@ -185,7 +188,7 @@ st.title("Philadelphia Assessment Lookup")
 
 st.write(
     "Paste a list of **Philadelphia property addresses** or upload a CSV with an "
-    " `address` column to look up **market values for 2025 and 2026** in bulk."
+    "`address` column to look up **market values for 2023–2026** in bulk."
 )
 
 # Address input
@@ -202,14 +205,20 @@ uploaded_file = st.file_uploader(
     label_visibility="collapsed",
 )
 
-# Year selection
+# ---- Year selection: 2023–2026 ----
 col_y1, col_y2 = st.columns(2)
 with col_y1:
-    year_2025 = st.checkbox("2025", value=True)
+    year_2023 = st.checkbox("2023", value=False)
+    year_2024 = st.checkbox("2024", value=False)
 with col_y2:
+    year_2025 = st.checkbox("2025", value=True)
     year_2026 = st.checkbox("2026", value=True)
 
-years = []
+years: List[int] = []
+if year_2023:
+    years.append(2023)
+if year_2024:
+    years.append(2024)
 if year_2025:
     years.append(2025)
 if year_2026:
@@ -220,7 +229,7 @@ if not years:
     st.stop()
 
 # Build address list
-addresses = []
+addresses: List[str] = []
 
 # From text area
 if addr_text.strip():
@@ -239,6 +248,7 @@ if uploaded_file is not None:
     except Exception as e:
         st.error(f"Could not read CSV file: {e}")
 
+# Run button
 if st.button("🔍 Run lookup", type="primary"):
     if not addresses:
         st.warning("Please paste at least one address or upload a CSV.")
@@ -270,3 +280,5 @@ if st.button("🔍 Run lookup", type="primary"):
             file_name="philly_assessments_results.csv",
             mime="text/csv",
         )
+else:
+    st.info("Paste addresses or upload a CSV, select years, then click **Run lookup**.")

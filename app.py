@@ -13,7 +13,6 @@ def call_carto(sql: str) -> Dict:
     """Run a SQL query against the CARTO API."""
     resp = requests.get(CARTO_SQL_URL, params={"q": sql})
     if resp.status_code != 200:
-        # Let the UI show this if needed
         raise RuntimeError(f"Carto API error {resp.status_code}: {resp.text}")
     return resp.json()
 
@@ -22,22 +21,15 @@ def normalize_address_for_search(address: str) -> str:
     """
     Clean user address and turn it into a pattern we can use with ILIKE
     against p.location in opa_properties_public_pde.
-
-    We go fairly loose here so we can still match things like:
-    - '780 UNION ST 1ST FL'
-    - '780 N UNION ST'
-    etc.
     """
     if not address:
         return ""
 
     # Only use first part if they paste "780 Union Street, Philadelphia, PA"
     a = address.strip().split(",")[0]
-
     if not a:
         return ""
 
-    # Uppercase for consistency
     a = a.upper()
 
     # Strip leading zeros from the house number
@@ -49,7 +41,6 @@ def normalize_address_for_search(address: str) -> str:
             pass
     a = " ".join(parts)
 
-    # Normalize common street suffixes to match OPA's abbreviations
     suffix_map = {
         " STREET": " ST",
         " AVENUE": " AVE",
@@ -66,7 +57,6 @@ def normalize_address_for_search(address: str) -> str:
             a = a[: -len(long_suffix)] + short_suffix
             break
 
-    # Escape single quotes for SQL and turn into an ILIKE *contains* pattern
     a = a.replace("'", "''")
     return f"%{a}%"   # e.g. "%780 UNION ST%"
 
@@ -100,6 +90,9 @@ def find_parcel_for_address(address: str) -> Dict | None:
 def get_assessments_for_parcel(parcel_number: str, years: List[int]) -> List[Dict]:
     """
     Step 2: Given a parcel_number, pull assessment rows from the assessments table.
+
+    IMPORTANT: we use SELECT * so we don't have to know the exact column names
+    (e.g. whatever they call the value fields).
     """
     if not parcel_number:
         return []
@@ -107,14 +100,7 @@ def get_assessments_for_parcel(parcel_number: str, years: List[int]) -> List[Dic
     years_clause = ", ".join(str(y) for y in sorted(set(years)))
 
     sql = f"""
-        SELECT
-            year AS tax_year,
-            market_value,
-            exempt_land,
-            exempt_building,
-            taxable_land,
-            taxable_building,
-            market_value_date
+        SELECT *
         FROM assessments
         WHERE parcel_number = '{parcel_number}'
           AND year IN ({years_clause})
@@ -130,43 +116,21 @@ def lookup_single_address(address: str, years: List[int]) -> List[Dict]:
     Full lookup for a single address:
     - find parcel in properties table
     - then fetch assessments for that parcel
-    - return combined rows (one per year), or a single "No match" row
+    - return combined rows (one per year), or a single "note" row
     """
     # Step 1: try to get parcel information
     parcel_row = None
     try:
         parcel_row = find_parcel_for_address(address)
     except Exception as e:
-        # If the properties query fails entirely
         return [{
             "input_address": address,
-            "parcel_number": None,
-            "full_address": None,
-            "zip_code": None,
-            "tax_year": ", ".join(str(y) for y in years),
-            "market_value": None,
-            "exempt_land": None,
-            "exempt_building": None,
-            "taxable_land": None,
-            "taxable_building": None,
-            "market_value_date": None,
             "note": f"Error looking up parcel: {e}",
         }]
 
     if not parcel_row:
-        # No parcel at all for this address
         return [{
             "input_address": address,
-            "parcel_number": None,
-            "full_address": None,
-            "zip_code": None,
-            "tax_year": ", ".join(str(y) for y in years),
-            "market_value": None,
-            "exempt_land": None,
-            "exempt_building": None,
-            "taxable_land": None,
-            "taxable_building": None,
-            "market_value_date": None,
             "note": "No parcel found for this address",
         }]
 
@@ -183,30 +147,15 @@ def lookup_single_address(address: str, years: List[int]) -> List[Dict]:
             "parcel_number": parcel_number,
             "full_address": full_address,
             "zip_code": zip_code,
-            "tax_year": ", ".join(str(y) for y in years),
-            "market_value": None,
-            "exempt_land": None,
-            "exempt_building": None,
-            "taxable_land": None,
-            "taxable_building": None,
-            "market_value_date": None,
             "note": f"Error looking up assessments: {e}",
         }]
 
     if not assessments:
-        # Parcel exists but no assessments for selected years
         return [{
             "input_address": address,
             "parcel_number": parcel_number,
             "full_address": full_address,
             "zip_code": zip_code,
-            "tax_year": ", ".join(str(y) for y in years),
-            "market_value": None,
-            "exempt_land": None,
-            "exempt_building": None,
-            "taxable_land": None,
-            "taxable_building": None,
-            "market_value_date": None,
             "note": "Parcel found, but no assessment records for selected years",
         }]
 
@@ -218,7 +167,6 @@ def lookup_single_address(address: str, years: List[int]) -> List[Dict]:
         rec["parcel_number"] = parcel_number
         rec["full_address"] = full_address
         rec["zip_code"] = zip_code
-        rec.setdefault("note", "")
         out_rows.append(rec)
 
     return out_rows
@@ -250,16 +198,6 @@ def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame,
             errors.append(f"{addr}: {e}")
             rows.append({
                 "input_address": addr,
-                "parcel_number": None,
-                "full_address": None,
-                "zip_code": None,
-                "tax_year": ", ".join(str(y) for y in years),
-                "market_value": None,
-                "exempt_land": None,
-                "exempt_building": None,
-                "taxable_land": None,
-                "taxable_building": None,
-                "market_value_date": None,
                 "note": f"Unexpected error: {e}",
             })
 
@@ -267,26 +205,25 @@ def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame,
 
     progress.empty()
 
-    if rows:
-        df = pd.DataFrame(rows)
-        # Nice column order
-        col_order = [
-            "input_address",
-            "parcel_number",
-            "full_address",
-            "zip_code",
-            "tax_year",
-            "market_value",
-            "exempt_land",
-            "exempt_building",
-            "taxable_land",
-            "taxable_building",
-            "market_value_date",
-            "note",
-        ]
-        df = df[[c for c in col_order if c in df.columns]]
-    else:
-        df = pd.DataFrame()
+    if not rows:
+        return pd.DataFrame(), errors
+
+    df = pd.DataFrame(rows)
+
+    # Try to put the most important columns first if they exist
+    preferred_order = [
+        "input_address",
+        "parcel_number",
+        "full_address",
+        "zip_code",
+        "year",          # assessments table's year
+        "note",
+    ]
+    # Keep existing columns but re-order with preferred ones at the front
+    cols = list(df.columns)
+    front = [c for c in preferred_order if c in cols]
+    rest = [c for c in cols if c not in front]
+    df = df[front + rest]
 
     return df, errors
 
@@ -302,7 +239,10 @@ st.title("Philadelphia Assessment Lookup")
 
 st.write(
     "Paste a list of **Philadelphia property addresses** or upload a CSV with an "
-    "`address` column to look up **market values for 2023–2026** in bulk."
+    "`address` column to look up **assessment records for 2023–2026** in bulk.\n\n"
+    "Because the City’s assessment schema changes over time, this tool pulls **all** "
+    "columns from the assessment table for each parcel/year. Look for columns whose "
+    "names contain words like `VALUE` or `ASSESSMENT` to see the dollar amounts."
 )
 
 # Address input
@@ -345,11 +285,9 @@ if not years:
 # Build address list
 addresses: List[str] = []
 
-# From text area
 if addr_text.strip():
     addresses.extend([line.strip() for line in addr_text.splitlines() if line.strip()])
 
-# From CSV
 if uploaded_file is not None:
     try:
         df_upload = pd.read_csv(uploaded_file)

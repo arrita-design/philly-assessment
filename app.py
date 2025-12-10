@@ -91,7 +91,7 @@ def get_assessments_for_parcel(parcel_number: str, years: List[int]) -> List[Dic
     """
     Step 2: Given a parcel_number, pull assessment rows from the assessments table.
 
-    IMPORTANT: we use SELECT * so we don't have to know the exact column names
+    We use SELECT * so we don't have to know the exact column names
     (e.g. whatever they call the value fields).
     """
     if not parcel_number:
@@ -119,7 +119,6 @@ def lookup_single_address(address: str, years: List[int]) -> List[Dict]:
     - return combined rows (one per year), or a single "note" row
     """
     # Step 1: try to get parcel information
-    parcel_row = None
     try:
         parcel_row = find_parcel_for_address(address)
     except Exception as e:
@@ -210,7 +209,7 @@ def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame,
 
     df = pd.DataFrame(rows)
 
-    # Try to put the most important columns first if they exist
+    # Put key columns first if they exist
     preferred_order = [
         "input_address",
         "parcel_number",
@@ -219,7 +218,6 @@ def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame,
         "year",          # assessments table's year
         "note",
     ]
-    # Keep existing columns but re-order with preferred ones at the front
     cols = list(df.columns)
     front = [c for c in preferred_order if c in cols]
     rest = [c for c in cols if c not in front]
@@ -240,9 +238,8 @@ st.title("Philadelphia Assessment Lookup")
 st.write(
     "Paste a list of **Philadelphia property addresses** or upload a CSV with an "
     "`address` column to look up **assessment records for 2023–2026** in bulk.\n\n"
-    "Because the City’s assessment schema changes over time, this tool pulls **all** "
-    "columns from the assessment table for each parcel/year. Look for columns whose "
-    "names contain words like `VALUE` or `ASSESSMENT` to see the dollar amounts."
+    "- The main dollar field is **`market_value`** (assessed market value per year).\n"
+    "- The app also returns raw `taxable_*` and `exempt_*` fields from the City.\n"
 )
 
 # Address input
@@ -322,9 +319,39 @@ if st.button("🔍 Run lookup", type="primary"):
     if results_df.empty:
         st.write("No results returned.")
     else:
-        st.dataframe(results_df, use_container_width=True)
+        # ---------- GRAND TOTAL (CLEARLY LABELED) ----------
+        if "market_value" in results_df.columns and pd.api.types.is_numeric_dtype(results_df["market_value"]):
+            total_market_value = results_df["market_value"].dropna().astype(float).sum()
+            st.markdown(
+                f"### Summary\n"
+                f"**Grand total market value (all properties & selected years):** "
+                f"`$ {total_market_value:,.0f}`"
+            )
+        else:
+            st.markdown(
+                "### Summary\n"
+                "_Column `market_value` not found or not numeric; "
+                "grand total cannot be calculated._"
+            )
 
-        # Download as CSV
+        # ---------- NUMBER FORMATTING FOR VALUE COLUMNS (DISPLAY ONLY) ----------
+        df_display = results_df.copy()
+
+        # Pick columns that look like dollar amounts
+        value_cols = [
+            c for c in df_display.columns
+            if any(term in c.lower() for term in ["value", "taxable", "exempt"])
+        ]
+
+        for col in value_cols:
+            if pd.api.types.is_numeric_dtype(df_display[col]):
+                df_display[col] = df_display[col].apply(
+                    lambda x: f"${x:,.0f}" if pd.notnull(x) else x
+                )
+
+        st.dataframe(df_display, use_container_width=True)
+
+        # CSV uses the original numeric data
         csv_bytes = results_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="📥 Download results as CSV",

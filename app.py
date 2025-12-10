@@ -22,6 +22,11 @@ def normalize_address_for_search(address: str) -> str:
     """
     Clean user address and turn it into a pattern we can use with ILIKE
     against p.location in opa_properties_public_pde.
+
+    We go fairly loose here so we can still match things like:
+    - '780 UNION ST 1ST FL'
+    - '780 N UNION ST'
+    etc.
     """
     if not address:
         return ""
@@ -66,40 +71,157 @@ def normalize_address_for_search(address: str) -> str:
     return f"%{a}%"   # e.g. "%780 UNION ST%"
 
 
-def lookup_single_address(address: str, years: List[int]) -> List[Dict]:
+def find_parcel_for_address(address: str) -> Dict | None:
     """
-    Look up one address for the selected tax years.
-    Returns a list of rows (dicts) from the joined OPA + assessments tables.
+    Step 1: Find a parcel in opa_properties_public_pde that matches this address.
+    Returns a single row dict with parcel_number, location, and zip_code,
+    or None if nothing matches.
     """
     pattern = normalize_address_for_search(address)
     if not pattern:
+        return None
+
+    sql = f"""
+        SELECT
+            parcel_number,
+            location AS full_address,
+            zip_code
+        FROM opa_properties_public_pde
+        WHERE location ILIKE '{pattern}'
+        ORDER BY parcel_number
+        LIMIT 1
+    """
+
+    data = call_carto(sql)
+    rows = data.get("rows", [])
+    return rows[0] if rows else None
+
+
+def get_assessments_for_parcel(parcel_number: str, years: List[int]) -> List[Dict]:
+    """
+    Step 2: Given a parcel_number, pull assessment rows from the assessments table.
+    """
+    if not parcel_number:
         return []
 
     years_clause = ", ".join(str(y) for y in sorted(set(years)))
 
-    # Use p.location (not full_address) and a.year (not tax_year)
     sql = f"""
         SELECT
-            p.parcel_number,
-            p.location AS full_address,
-            p.zip_code,
-            a.year AS tax_year,
-            a.market_value,
-            a.exempt_land,
-            a.exempt_building,
-            a.taxable_land,
-            a.taxable_building,
-            a.market_value_date
-        FROM opa_properties_public_pde p
-        JOIN assessments a
-          ON p.parcel_number = a.parcel_number
-        WHERE a.year IN ({years_clause})
-          AND p.location ILIKE '{pattern}'
-        ORDER BY a.year
+            year AS tax_year,
+            market_value,
+            exempt_land,
+            exempt_building,
+            taxable_land,
+            taxable_building,
+            market_value_date
+        FROM assessments
+        WHERE parcel_number = '{parcel_number}'
+          AND year IN ({years_clause})
+        ORDER BY year
     """
 
     data = call_carto(sql)
     return data.get("rows", [])
+
+
+def lookup_single_address(address: str, years: List[int]) -> List[Dict]:
+    """
+    Full lookup for a single address:
+    - find parcel in properties table
+    - then fetch assessments for that parcel
+    - return combined rows (one per year), or a single "No match" row
+    """
+    # Step 1: try to get parcel information
+    parcel_row = None
+    try:
+        parcel_row = find_parcel_for_address(address)
+    except Exception as e:
+        # If the properties query fails entirely
+        return [{
+            "input_address": address,
+            "parcel_number": None,
+            "full_address": None,
+            "zip_code": None,
+            "tax_year": ", ".join(str(y) for y in years),
+            "market_value": None,
+            "exempt_land": None,
+            "exempt_building": None,
+            "taxable_land": None,
+            "taxable_building": None,
+            "market_value_date": None,
+            "note": f"Error looking up parcel: {e}",
+        }]
+
+    if not parcel_row:
+        # No parcel at all for this address
+        return [{
+            "input_address": address,
+            "parcel_number": None,
+            "full_address": None,
+            "zip_code": None,
+            "tax_year": ", ".join(str(y) for y in years),
+            "market_value": None,
+            "exempt_land": None,
+            "exempt_building": None,
+            "taxable_land": None,
+            "taxable_building": None,
+            "market_value_date": None,
+            "note": "No parcel found for this address",
+        }]
+
+    parcel_number = parcel_row.get("parcel_number")
+    full_address = parcel_row.get("full_address")
+    zip_code = parcel_row.get("zip_code")
+
+    # Step 2: get assessment rows for this parcel
+    try:
+        assessments = get_assessments_for_parcel(parcel_number, years)
+    except Exception as e:
+        return [{
+            "input_address": address,
+            "parcel_number": parcel_number,
+            "full_address": full_address,
+            "zip_code": zip_code,
+            "tax_year": ", ".join(str(y) for y in years),
+            "market_value": None,
+            "exempt_land": None,
+            "exempt_building": None,
+            "taxable_land": None,
+            "taxable_building": None,
+            "market_value_date": None,
+            "note": f"Error looking up assessments: {e}",
+        }]
+
+    if not assessments:
+        # Parcel exists but no assessments for selected years
+        return [{
+            "input_address": address,
+            "parcel_number": parcel_number,
+            "full_address": full_address,
+            "zip_code": zip_code,
+            "tax_year": ", ".join(str(y) for y in years),
+            "market_value": None,
+            "exempt_land": None,
+            "exempt_building": None,
+            "taxable_land": None,
+            "taxable_building": None,
+            "market_value_date": None,
+            "note": "Parcel found, but no assessment records for selected years",
+        }]
+
+    # Combine parcel info with each assessment row
+    out_rows: List[Dict] = []
+    for a in assessments:
+        rec = dict(a)
+        rec["input_address"] = address
+        rec["parcel_number"] = parcel_number
+        rec["full_address"] = full_address
+        rec["zip_code"] = zip_code
+        rec.setdefault("note", "")
+        out_rows.append(rec)
+
+    return out_rows
 
 
 def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame, List[str]]:
@@ -122,18 +244,10 @@ def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame,
 
     for idx, addr in enumerate(unique_addresses, start=1):
         try:
-            matches = lookup_single_address(addr, years)
+            addr_rows = lookup_single_address(addr, years)
+            rows.extend(addr_rows)
         except Exception as e:
             errors.append(f"{addr}: {e}")
-            matches = []
-
-        if matches:
-            for m in matches:
-                rec = dict(m)
-                rec["input_address"] = addr
-                rows.append(rec)
-        else:
-            # No match found – add a placeholder row
             rows.append({
                 "input_address": addr,
                 "parcel_number": None,
@@ -146,7 +260,7 @@ def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame,
                 "taxable_land": None,
                 "taxable_building": None,
                 "market_value_date": None,
-                "note": "No match found",
+                "note": f"Unexpected error: {e}",
             })
 
         progress.progress(idx / len(unique_addresses), text=progress_text)
@@ -155,7 +269,7 @@ def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame,
 
     if rows:
         df = pd.DataFrame(rows)
-        # Order columns a bit nicer if they exist
+        # Nice column order
         col_order = [
             "input_address",
             "parcel_number",

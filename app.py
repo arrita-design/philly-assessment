@@ -1,7 +1,18 @@
+import io
 import requests
 import pandas as pd
 import streamlit as st
 from typing import List, Tuple, Dict
+
+# Try to import reportlab for PDF export
+try:
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.pagesizes import letter, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
 
 # CARTO SQL endpoint for Philly open data
 CARTO_SQL_URL = "https://phl.carto.com/api/v2/sql"
@@ -226,6 +237,60 @@ def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame,
     return df, errors
 
 
+def make_pdf_from_dataframe(df: pd.DataFrame, title: str, grand_total: float | None = None) -> bytes:
+    """
+    Create a simple PDF report from a DataFrame and return it as bytes.
+    Uses reportlab. If reportlab isn't available, caller shouldn't call this.
+    """
+    buffer = io.BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(letter),
+        leftMargin=30,
+        rightMargin=30,
+        topMargin=30,
+        bottomMargin=30,
+    )
+
+    styles = getSampleStyleSheet()
+    elements = []
+
+    elements.append(Paragraph(title, styles["Title"]))
+    elements.append(Spacer(1, 12))
+
+    if grand_total is not None:
+        total_text = f"Grand total market value (all properties & selected years): $ {grand_total:,.0f}"
+        elements.append(Paragraph(total_text, styles["Heading3"]))
+        elements.append(Spacer(1, 12))
+
+    # Limit to first 300 rows so the PDF doesn't explode
+    df_pdf = df.copy()
+    if len(df_pdf) > 300:
+        df_pdf = df_pdf.head(300)
+
+    # Convert DataFrame to table data (header + rows)
+    table_data = [list(df_pdf.columns)] + df_pdf.astype(str).values.tolist()
+
+    table = Table(table_data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+    ]))
+
+    elements.append(table)
+    doc.build(elements)
+
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+
 # ---------- Streamlit UI ----------
 
 st.set_page_config(
@@ -238,7 +303,7 @@ st.title("Philadelphia Assessment Lookup")
 st.write(
     "Paste a list of **Philadelphia property addresses** or upload a CSV with an "
     "`address` column to look up **assessment records for 2023–2026** in bulk.\n\n"
-    "- The main dollar field is **`market_value`** (assessed market value per year).\n"
+    "- The main dollar field is typically **`market_value`** (assessed market value per year).\n"
     "- The app also returns raw `taxable_*` and `exempt_*` fields from the City.\n"
 )
 
@@ -320,12 +385,13 @@ if st.button("🔍 Run lookup", type="primary"):
         st.write("No results returned.")
     else:
         # ---------- GRAND TOTAL (CLEARLY LABELED) ----------
+        grand_total = None
         if "market_value" in results_df.columns and pd.api.types.is_numeric_dtype(results_df["market_value"]):
-            total_market_value = results_df["market_value"].dropna().astype(float).sum()
+            grand_total = results_df["market_value"].dropna().astype(float).sum()
             st.markdown(
                 f"### Summary\n"
                 f"**Grand total market value (all properties & selected years):** "
-                f"`$ {total_market_value:,.0f}`"
+                f"`$ {grand_total:,.0f}`"
             )
         else:
             st.markdown(
@@ -351,7 +417,7 @@ if st.button("🔍 Run lookup", type="primary"):
 
         st.dataframe(df_display, use_container_width=True)
 
-        # CSV uses the original numeric data
+        # ---------- CSV DOWNLOAD (RAW NUMBERS) ----------
         csv_bytes = results_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="📥 Download results as CSV",
@@ -359,5 +425,24 @@ if st.button("🔍 Run lookup", type="primary"):
             file_name="philly_assessments_results.csv",
             mime="text/csv",
         )
+
+        # ---------- PDF DOWNLOAD ----------
+        if REPORTLAB_AVAILABLE:
+            pdf_bytes = make_pdf_from_dataframe(
+                df_display,  # use formatted values in the PDF
+                title="Philadelphia Assessment Lookup",
+                grand_total=grand_total,
+            )
+            st.download_button(
+                label="📄 Download results as PDF",
+                data=pdf_bytes,
+                file_name="philly_assessments_results.pdf",
+                mime="application/pdf",
+            )
+        else:
+            st.info(
+                "PDF download is disabled because the `reportlab` package is not installed. "
+                "Add `reportlab` to your `requirements.txt` to enable PDF export."
+            )
 else:
     st.info("Paste addresses or upload a CSV, select years, then click **Run lookup**.")

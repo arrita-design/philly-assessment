@@ -2,7 +2,7 @@ import io
 import requests
 import pandas as pd
 import streamlit as st
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 # Try to import reportlab for PDF export
 try:
@@ -15,7 +15,7 @@ try:
     )
     from reportlab.lib.pagesizes import letter, landscape
     from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
@@ -243,7 +243,8 @@ def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame,
     return df, errors
 
 
-def make_pdf_from_dataframe(df_display: pd.DataFrame, grand_total: float | None = None) -> bytes:
+def make_pdf_from_dataframe(df_display: pd.DataFrame,
+                            grand_total: Optional[float] = None) -> bytes:
     """
     Create a PDF report from a *display* DataFrame and return it as bytes.
 
@@ -256,12 +257,18 @@ def make_pdf_from_dataframe(df_display: pd.DataFrame, grand_total: float | None 
     - taxable_building
     - exempt_land
     - exempt_building
+
+    We also:
+    - use landscape orientation
+    - set fixed column widths
+    - use small font and wrapped text
     """
     buffer = io.BytesIO()
 
+    page_size = landscape(letter)
     doc = SimpleDocTemplate(
         buffer,
-        pagesize=landscape(letter),
+        pagesize=page_size,
         leftMargin=30,
         rightMargin=30,
         topMargin=30,
@@ -269,18 +276,27 @@ def make_pdf_from_dataframe(df_display: pd.DataFrame, grand_total: float | None 
     )
 
     styles = getSampleStyleSheet()
+    base_style = ParagraphStyle(
+        "CellStyle",
+        parent=styles["BodyText"],
+        fontSize=7,
+        leading=8,
+    )
+
     elements = []
 
+    # Title
     elements.append(Paragraph("Philadelphia Assessment Lookup", styles["Title"]))
-    elements.append(Spacer(1, 12))
+    elements.append(Spacer(1, 8))
 
+    # Grand total line
     if grand_total is not None:
         total_text = (
             f"Grand total market value (all properties & selected years): "
             f"$ {grand_total:,.0f}"
         )
         elements.append(Paragraph(total_text, styles["Heading3"]))
-        elements.append(Spacer(1, 12))
+        elements.append(Spacer(1, 8))
 
     # Choose a subset of columns for the PDF to ensure it fits
     pdf_cols_preferred = [
@@ -305,17 +321,28 @@ def make_pdf_from_dataframe(df_display: pd.DataFrame, grand_total: float | None 
     if len(df_pdf) > 300:
         df_pdf = df_pdf.head(300)
 
-    # Convert to table data
-    table_data = [list(df_pdf.columns)] + df_pdf.astype(str).values.tolist()
+    # Convert to table data with Paragraphs for wrapping
+    header_row = [Paragraph(str(col), base_style) for col in df_pdf.columns]
+    data_rows = [
+        [Paragraph(str(val), base_style) for val in row]
+        for row in df_pdf.astype(str).values.tolist()
+    ]
+    table_data = [header_row] + data_rows
 
-    table = Table(table_data, repeatRows=1)
+    # Column widths: divide usable width across columns
+    total_width = page_size[0] - doc.leftMargin - doc.rightMargin
+    num_cols = len(available_cols)
+    col_width = total_width / num_cols if num_cols > 0 else total_width
+    col_widths = [col_width] * num_cols
+
+    table = Table(table_data, repeatRows=1, colWidths=col_widths)
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("ALIGN", (0, 0), (-1, -1), "LEFT"),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
         ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
     ]))
 
@@ -421,7 +448,7 @@ if st.button("🔍 Run lookup", type="primary"):
         st.write("No results returned.")
     else:
         # ---------- GRAND TOTAL (CLEARLY LABELED) ----------
-        grand_total = None
+        grand_total: Optional[float] = None
         if "market_value" in results_df.columns and pd.api.types.is_numeric_dtype(results_df["market_value"]):
             grand_total = results_df["market_value"].dropna().astype(float).sum()
             st.markdown(
@@ -481,3 +508,4 @@ if st.button("🔍 Run lookup", type="primary"):
             )
 else:
     st.info("Paste addresses or upload a CSV, select years, then click **Run lookup**.")
+ then click **Run lookup**.")

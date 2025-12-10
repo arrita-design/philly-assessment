@@ -6,7 +6,13 @@ from typing import List, Tuple, Dict
 
 # Try to import reportlab for PDF export
 try:
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.platypus import (
+        SimpleDocTemplate,
+        Table,
+        TableStyle,
+        Paragraph,
+        Spacer,
+    )
     from reportlab.lib.pagesizes import letter, landscape
     from reportlab.lib import colors
     from reportlab.lib.styles import getSampleStyleSheet
@@ -237,10 +243,19 @@ def build_results(addresses: List[str], years: List[int]) -> Tuple[pd.DataFrame,
     return df, errors
 
 
-def make_pdf_from_dataframe(df: pd.DataFrame, title: str, grand_total: float | None = None) -> bytes:
+def make_pdf_from_dataframe(df_display: pd.DataFrame, grand_total: float | None = None) -> bytes:
     """
-    Create a simple PDF report from a DataFrame and return it as bytes.
-    Uses reportlab. If reportlab isn't available, caller shouldn't call this.
+    Create a PDF report from a *display* DataFrame and return it as bytes.
+
+    To keep things fitting on the page, we only include a subset of columns:
+    - input_address
+    - full_address
+    - year
+    - market_value
+    - taxable_land
+    - taxable_building
+    - exempt_land
+    - exempt_building
     """
     buffer = io.BytesIO()
 
@@ -256,20 +271,41 @@ def make_pdf_from_dataframe(df: pd.DataFrame, title: str, grand_total: float | N
     styles = getSampleStyleSheet()
     elements = []
 
-    elements.append(Paragraph(title, styles["Title"]))
+    elements.append(Paragraph("Philadelphia Assessment Lookup", styles["Title"]))
     elements.append(Spacer(1, 12))
 
     if grand_total is not None:
-        total_text = f"Grand total market value (all properties & selected years): $ {grand_total:,.0f}"
+        total_text = (
+            f"Grand total market value (all properties & selected years): "
+            f"$ {grand_total:,.0f}"
+        )
         elements.append(Paragraph(total_text, styles["Heading3"]))
         elements.append(Spacer(1, 12))
 
-    # Limit to first 300 rows so the PDF doesn't explode
-    df_pdf = df.copy()
+    # Choose a subset of columns for the PDF to ensure it fits
+    pdf_cols_preferred = [
+        "input_address",
+        "full_address",
+        "year",
+        "market_value",
+        "taxable_land",
+        "taxable_building",
+        "exempt_land",
+        "exempt_building",
+    ]
+    available_cols = [c for c in pdf_cols_preferred if c in df_display.columns]
+
+    # Fallback: if something weird happens, just use whatever columns exist
+    if not available_cols:
+        available_cols = list(df_display.columns)
+
+    df_pdf = df_display[available_cols].copy()
+
+    # Limit to first 300 rows so PDF doesn't get massive
     if len(df_pdf) > 300:
         df_pdf = df_pdf.head(300)
 
-    # Convert DataFrame to table data (header + rows)
+    # Convert to table data
     table_data = [list(df_pdf.columns)] + df_pdf.astype(str).values.tolist()
 
     table = Table(table_data, repeatRows=1)
@@ -430,7 +466,6 @@ if st.button("🔍 Run lookup", type="primary"):
         if REPORTLAB_AVAILABLE:
             pdf_bytes = make_pdf_from_dataframe(
                 df_display,  # use formatted values in the PDF
-                title="Philadelphia Assessment Lookup",
                 grand_total=grand_total,
             )
             st.download_button(
